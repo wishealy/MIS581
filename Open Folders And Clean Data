@@ -1,0 +1,249 @@
+import pandas as pd
+import numpy as np
+from datetime import datetime, timedelta
+from caas_jupyter_tools import display_dataframe_to_user
+
+# Load source workbook already on disk
+src_path = "/mnt/data/SetUpDataframeTables.xlsx"
+xlsx = pd.ExcelFile(src_path)
+tables = {name: pd.read_excel(src_path, sheet_name=name) for name in xlsx.sheet_names}
+
+# Keep non-zz tables (as established earlier)
+keep_names = [n for n in tables if not n.startswith("zz")]
+tbl = {n: tables[n].copy() for n in keep_names}
+
+# Convenience references
+params = tbl["Monitoring Parameters"].copy()
+param_values = tbl["Parameter Values"].copy()
+ind_info = tbl["Industrial Facility Information"].copy()
+gen = tbl["General Data"].copy()
+wq = tbl["WWTP Information"].copy()
+ind_user_conc = tbl["Ind User Concentration"].copy()
+ind_alloc_limits = tbl["Ind. Allocation Limits"].copy()
+
+# --- Normalize key columns ---
+# Parameter ID list
+param_ids = params["Parameter ID"].dropna().astype(str).unique().tolist()
+
+# Industry list (prefer a name/ID column present)
+# Try to find columns for facility name and id
+cand_name_cols = [c for c in ind_info.columns if "Name" in c or "Facility" in c]
+cand_id_cols = [c for c in ind_info.columns if "ID" in c and "WWTP" not in c]
+
+fac_name_col = cand_name_cols[0] if cand_name_cols else ind_info.columns[0]
+fac_id_col = cand_id_cols[0] if cand_id_cols else None
+
+facilities = ind_info[[fac_name_col] + ([fac_id_col] if fac_id_col else [])].dropna(subset=[fac_name_col]).drop_duplicates()
+facility_names = facilities[fac_name_col].astype(str).str.strip().unique().tolist()
+
+# WWTP context
+wwtp_ids = wq["WWTP ID"].dropna().astype(int).tolist() if "WWTP ID" in wq.columns else [1]
+wwtp_id = wwtp_ids[0] if wwtp_ids else 1
+
+# -------------------------------
+# 1) Populate Parameter Values
+# -------------------------------
+# Inspect numeric-like columns in the existing Parameter Values table to preserve schema
+pv = param_values.copy()
+# Identify numeric candidate columns (existing schema)
+num_cols = [c for c in pv.columns if c != "Parameter ID"]
+# Build a synthetic frame respecting existing columns
+pv_out = pd.DataFrame({"Parameter ID": param_ids})
+
+rng = np.random.default_rng(42)
+
+def positive_lognormal(n, mean=1.0, sigma=0.5, scale=1.0):
+    # Generate positive skew values
+    vals = rng.lognormal(mean=np.log(mean), sigma=sigma, size=n) * scale
+    return vals
+
+# Heuristic baselines per parameter using acronyms when available
+acronym_map = dict(zip(params["Parameter ID"], params.get("Parameter Acronym", params["Parameter ID"])))
+unit_map = dict(zip(params["Parameter ID"], params.get("Unit", ["mg/L"]*len(params))))
+
+# Set baseline typical concentrations (mg/L) by parameter family keywords
+def baseline_for_param(pid: str):
+    key = pid.lower()
+    # Metals lower; organics moderate; solids higher
+    if any(k in key for k in ["arsenic", "cadmium", "mercury", "lead", "nickel", "chromium", "silver", "selenium", "molybdenum", "antimony", "beryllium", "thallium"]):
+        return 0.05, 0.2   # mean, sigma
+    if any(k in key for k in ["bod", "tss", "cod"]):
+        return 200, 0.6
+    if any(k in key for k in ["ammonia", "nh3", "tkn"]):
+        return 25, 0.5
+    if "chloride" in key:
+        return 250, 0.4
+    if "sulfate" in key:
+        return 300, 0.4
+    if "cyanide" in key or "phenol" in key:
+        return 0.2, 0.5
+    if "phosphorus" in key or "tp." in key:
+        return 5, 0.5
+    if "tn." in key or "nitrogen" in key:
+        return 25, 0.5
+    if "ph" in key:
+        return 7, 0.2
+    return 10, 0.6
+
+# Create synthetic numeric columns consistent with schema
+n_params = len(pv_out)
+for col in num_cols:
+    # Choose a distribution depending on column semantics
+    col_l = col.lower()
+    if any(k in col_l for k in ["limit", "standard", "criteria"]):
+        # Regulatory-like values (mg/L or lb/d). Tie to baseline scale.
+        vals = []
+        for pid in pv_out["Parameter ID"]:
+            mean, sigma = baseline_for_param(pid)
+            # Limit ~ between 0.5*mean and 1.5*mean
+            lim = rng.uniform(0.5*mean, 1.5*mean)
+            vals.append(lim)
+        pv_out[col] = np.array(vals)
+    elif any(k in col_l for k in ["removal", "efficiency"]):
+        # Percent efficiency 50-99%
+        pv_out[col] = rng.uniform(55, 98.5, size=n_params)
+    elif any(k in col_l for k in ["flow", "load", "lb/d"]):
+        # Loads scale with concentration; assume design flow 10 MGD -> 8.34*mg/L*MGD
+        vals = []
+        for pid in pv_out["Parameter ID"]:
+            mean, sigma = baseline_for_param(pid)
+            mgL = rng.uniform(0.3*mean, 1.8*mean)
+            load = 8.34 * mgL * rng.uniform(3, 15)  # mg/L * MGD -> lb/d approx
+            vals.append(load)
+        pv_out[col] = np.array(vals)
+    else:
+        # Generic numeric
+        pv_out[col] = positive_lognormal(n_params, mean=5, sigma=0.8)
+
+# Introduce ~5% missingness randomly to simulate real-world
+for col in pv_out.columns:
+    if col == "Parameter ID": 
+        continue
+    mask = rng.random(n_params) < 0.05
+    pv_out.loc[mask, col] = np.nan
+
+# -------------------------------
+# 2) Populate Monitoring Data
+# -------------------------------
+# We'll mark all parameters as monitored at this single WWTP
+md_out = pd.DataFrame({
+    "WWTP ID": [wwtp_id]*len(param_ids),
+    "Parameter ID": param_ids
+})
+
+# -------------------------------
+# 3) Populate Industrial Allocation Limits
+# -------------------------------
+# Build permits per (industry, parameter)
+industries = facility_names
+# limit concentration guided by Parameter Values limits; fallback baseline
+limit_lookup = {}
+limit_cols = [c for c in pv_out.columns if "limit" in c.lower()]
+if limit_cols:
+    limit_col = limit_cols[0]
+    limit_lookup = dict(zip(pv_out["Parameter ID"], pv_out[limit_col]))
+
+rows = []
+for fac in industries:
+    # pick 10-18 parameters per industry to limit
+    chosen_params = rng.choice(param_ids, size=rng.integers(10, min(18, len(param_ids))), replace=False)
+    for pid in chosen_params:
+        base_mean, _ = baseline_for_param(pid)
+        lim = limit_lookup.get(pid, rng.uniform(0.6*base_mean, 1.4*base_mean))
+        load_lim = 8.34 * lim * rng.uniform(0.05, 0.6)  # scale by nominal small MGD
+        rows.append({
+            "WWTP ID": wwtp_id,
+            "Industrial Facility Name": fac,
+            "Parameter ID": pid,
+            "Permit Limit (Conc. mg/L)": float(lim),
+            "Permit Limit (Load lb/d)": float(load_lim)
+        })
+
+ial_out = pd.DataFrame(rows)
+
+# Introduce ~3% missing permit limits to reflect incomplete data
+for col in ["Permit Limit (Conc. mg/L)", "Permit Limit (Load lb/d)"]:
+    mask = rng.random(len(ial_out)) < 0.03
+    ial_out.loc[mask, col] = np.nan
+
+# -------------------------------
+# 4) Populate Industrial User Concentration (time series)
+# -------------------------------
+# target ~10k total rows across tables; we'll generate ~9000 here
+target_rows = 9000
+# Build random (industry, parameter) pairs with multiple samples over time
+pairs = [(fac, pid) for fac in industries for pid in rng.choice(param_ids, size=6, replace=False)]
+rng.shuffle(pairs)
+
+samples = []
+start_date = datetime(2024, 1, 1)
+for fac, pid in pairs:
+    # Number of samples for this pair
+    n = rng.integers(8, 30)
+    # Pull permit limit (if exists) to shape distribution
+    plim = ial_out.loc[(ial_out["Industrial Facility Name"] == fac) & (ial_out["Parameter ID"] == pid), "Permit Limit (Conc. mg/L)"]
+    plim = plim.iloc[0] if not plim.empty else None
+    mean_c, sigma_c = baseline_for_param(pid)
+    # Generate concentrations around 0.7*limit with lognormal noise; add exceedances with small probability
+    if plim and not np.isnan(plim):
+        base = 0.7 * plim
+        data = rng.lognormal(mean=np.log(max(base, 1e-3)), sigma=0.4, size=n)
+        # 10% chance of exceedance spikes
+        spike_mask = rng.random(n) < 0.10
+        data[spike_mask] *= rng.uniform(1.2, 3.0, size=spike_mask.sum())
+    else:
+        # fallback on baseline
+        data = rng.lognormal(mean=np.log(max(mean_c, 1e-3)), sigma=0.6, size=n)
+    # Create dates and add some randomness
+    dates = [start_date + timedelta(days=int(i)) for i in np.cumsum(rng.integers(1, 20, size=n))]
+    for val, dt in zip(data, dates):
+        samples.append({
+            "WWTP ID": wwtp_id,
+            "Industrial Facility Name": fac,
+            "Parameter ID": pid,
+            "Recorded Value": float(val),
+            "Date Collected": dt.date()
+        })
+    if len(samples) >= target_rows:
+        break
+
+iuc_out = pd.DataFrame(samples).head(target_rows)
+
+# Introduce missingness (~7%) and a few formatting issues
+mask_nan = rng.random(len(iuc_out)) < 0.07
+iuc_out.loc[mask_nan, "Recorded Value"] = np.nan
+
+# Randomly string-cast some numeric values to simulate messy inputs (~2%)
+mask_str = rng.random(len(iuc_out)) < 0.02
+iuc_out.loc[mask_str, "Recorded Value"] = iuc_out.loc[mask_str, "Recorded Value"].round(2).astype(str)
+
+# Inject a handful of outliers (0.5%)
+idx_outliers = iuc_out.sample(frac=0.005, random_state=42).index
+iuc_out.loc[idx_outliers, "Recorded Value"] = iuc_out.loc[idx_outliers, "Recorded Value"].astype(float) * rng.uniform(5, 15, size=len(idx_outliers))
+
+# -------------------------------
+# Assemble counts and save to a new workbook
+# -------------------------------
+summary = {
+    "Parameter Values rows": len(pv_out),
+    "Monitoring Data rows": len(md_out),
+    "Ind. Allocation Limits rows": len(ial_out),
+    "Ind User Concentration rows": len(iuc_out),
+    "TOTAL rows across 4 tables": len(pv_out) + len(md_out) + len(ial_out) + len(iuc_out)
+}
+
+# Save synthetic tables to a new Excel file
+out_path = "/mnt/data/synthetic_industrial_dataset.xlsx"
+with pd.ExcelWriter(out_path, engine="xlsxwriter") as writer:
+    pv_out.to_excel(writer, index=False, sheet_name="Parameter Values")
+    md_out.to_excel(writer, index=False, sheet_name="Monitoring Data")
+    ial_out.to_excel(writer, index=False, sheet_name="Ind. Allocation Limits")
+    iuc_out.to_excel(writer, index=False, sheet_name="Ind User Concentration")
+
+# Display small previews to the user
+display_dataframe_to_user("Parameter Values (preview)", pv_out.head(15))
+display_dataframe_to_user("Monitoring Data (preview)", md_out.head(20))
+display_dataframe_to_user("Ind. Allocation Limits (preview)", ial_out.head(20))
+display_dataframe_to_user("Ind User Concentration (preview)", iuc_out.head(20))
+
+summary
