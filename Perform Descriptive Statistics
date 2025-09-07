@@ -1,0 +1,56 @@
+import pandas as pd
+
+# Function to generate descriptive statistics including nulls, IQR, etc.
+def extended_describe(df: pd.DataFrame, name: str):
+    desc = []
+    for col in df.columns:
+        if pd.api.types.is_numeric_dtype(df[col]):
+            series = df[col].dropna()
+            if len(series) == 0:
+                stats = {
+                    "Table": name,
+                    "Column": col,
+                    "Count": 0,
+                    "Nulls": df[col].isna().sum(),
+                    "Mean": None,
+                    "Std": None,
+                    "Min": None,
+                    "25%": None,
+                    "50%": None,
+                    "75%": None,
+                    "Max": None,
+                    "IQR": None,
+                }
+            else:
+                q1 = series.quantile(0.25)
+                q3 = series.quantile(0.75)
+                stats = {
+                    "Table": name,
+                    "Column": col,
+                    "Count": series.count(),
+                    "Nulls": df[col].isna().sum(),
+                    "Mean": series.mean(),
+                    "Std": series.std(),
+                    "Min": series.min(),
+                    "25%": q1,
+                    "50%": series.median(),
+                    "75%": q3,
+                    "Max": series.max(),
+                    "IQR": q3 - q1,
+                }
+            desc.append(stats)
+    return pd.DataFrame(desc)
+
+# Run extended stats for each table
+pv_stats  = extended_describe(parameter_values_df, "Parameter Values")
+md_stats  = extended_describe(monitoring_data_df, "Monitoring Data")
+ial_stats = extended_describe(ind_allocation_limits_df, "Industrial Allocation Limits")
+iuc_stats = extended_describe(ind_user_concentration_df, "Industrial User Concentration")
+
+# Combine all results
+all_stats = pd.concat([pv_stats, md_stats, ial_stats, iuc_stats], ignore_index=True)
+
+import caas_jupyter_tools
+caas_jupyter_tools.display_dataframe_to_user("Descriptive Statistics (All Tables)", all_stats)
+
+all_stats.head(20)
