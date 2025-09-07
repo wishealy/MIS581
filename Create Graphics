@@ -1,0 +1,227 @@
+# Generate statistical graphics for mixture analysis using matplotlib (no seaborn)
+
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from itertools import combinations
+from pathlib import Path
+
+# -----------------------
+# Load data & rebuild key tables (robust to resets)
+# -----------------------
+file_path = Path("/mnt/data/industrial_dataset.xlsx")
+xlsx = pd.ExcelFile(file_path)
+dfs = {sheet: pd.read_excel(file_path, sheet_name=sheet) for sheet in xlsx.sheet_names}
+
+conc = dfs["Ind User Concentration"].copy()
+lims = dfs["Ind. Allocation Limits"].copy()
+
+def clean_cols(df):
+    df = df.copy()
+    df.columns = [str(c).strip() for c in df.columns]
+    return df
+
+conc = clean_cols(conc)
+lims = clean_cols(lims)
+
+# Types
+conc["Recorded Value"] = pd.to_numeric(conc["Recorded Value"], errors="coerce")
+conc["WWTP ID"] = pd.to_numeric(conc["WWTP ID"], errors="coerce")
+conc["Date Collected"] = pd.to_datetime(conc["Date Collected"], errors="coerce")
+lims["WWTP ID"] = pd.to_numeric(lims["WWTP ID"], errors="coerce")
+lims["Permit Limit (Conc. mg/L)"] = pd.to_numeric(lims["Permit Limit (Conc. mg/L)"], errors="coerce")
+
+# ND rule
+conc.loc[conc["Recorded Value"] < 0.01, "Recorded Value"] = 0.005
+
+# Merge to compute C/L
+merged = pd.merge(
+    conc,
+    lims[["WWTP ID","Industrial Facility Name","Parameter ID","Permit Limit (Conc. mg/L)"]],
+    on=["WWTP ID","Industrial Facility Name","Parameter ID"],
+    how="left"
+)
+merged["CL_Ratio"] = merged["Recorded Value"] / merged["Permit Limit (Conc. mg/L)"]
+merged["Exceedance"] = merged["CL_Ratio"] > 1.0
+
+# Keep rows with usable ratio and date
+work = merged.dropna(subset=["CL_Ratio", "Date Collected"]).copy()
+
+# Pivot to facility-date x parameter
+group_cols = ["WWTP ID", "Industrial Facility Name", "Date Collected"]
+pivot = work.pivot_table(index=group_cols, columns="Parameter ID", values="CL_Ratio", aggfunc="max")
+
+# Mixture metrics
+mixture_sum = pivot.sum(axis=1, skipna=True)
+single_exceed = (pivot > 1.0).any(axis=1)
+mixture_exceed = (mixture_sum >= 1.0) & (~single_exceed)
+
+mixture_summary = pd.DataFrame({
+    "Mixture_Sum": mixture_sum,
+    "Any_Single_Exceed": single_exceed,
+    "Mixture_Exceed_Only": mixture_exceed
+}).reset_index()
+
+# High-threshold flags for co-occurrence
+high_flags = (pivot >= 0.8).astype(int)
+support = high_flags.sum(axis=0).astype(int)
+
+# Co-occurrence matrix (pairs)
+co_mat = (high_flags.T @ high_flags).astype(int)
+for c in co_mat.columns:
+    co_mat.loc[c, c] = 0
+
+n_groups = len(high_flags)
+
+# -----------------------
+# FIGURE 1: Distribution of Mixture Sum (Σ C/L per sample)
+# -----------------------
+fig1_path = "/mnt/data/fig1_mixture_sum_hist.png"
+plt.figure()
+valid = mixture_summary["Mixture_Sum"].dropna()
+plt.hist(valid, bins=50)
+plt.title("Distribution of Mixture Burden (Σ C/L)")
+plt.xlabel("Mixture Sum (Σ C/L across analytes)")
+plt.ylabel("Count")
+
+# Annotate percentiles
+for q in [0.5, 0.75, 0.9, 0.95, 0.99]:
+    v = valid.quantile(q)
+    plt.axvline(v, linestyle="--")
+    plt.text(v, plt.ylim()[1]*0.9, f"P{int(q*100)}={v:.2f}", rotation=90, va="top")
+
+plt.tight_layout()
+plt.savefig(fig1_path, dpi=200)
+plt.show()
+
+# -----------------------
+# FIGURE 2: Heatmap of Pairwise LIFT for top-12 frequent "high" pollutants (C/L ≥ 0.8)
+# -----------------------
+fig2_path = "/mnt/data/fig2_lift_heatmap_top12.png"
+top_pollutants = support.sort_values(ascending=False).head(12).index.tolist()
+
+# Build lift matrix for these
+lift_mat = np.zeros((len(top_pollutants), len(top_pollutants)))
+supp_vec = support[top_pollutants].values
+for i, a in enumerate(top_pollutants):
+    for j, b in enumerate(top_pollutants):
+        if i == j:
+            lift_mat[i, j] = np.nan
+            continue
+        co = co_mat.loc[a, b]
+        lift = (co * n_groups) / (support[a] * support[b]) if (support[a] > 0 and support[b] > 0) else np.nan
+        lift_mat[i, j] = lift
+
+plt.figure()
+im = plt.imshow(lift_mat, aspect="auto")
+plt.xticks(range(len(top_pollutants)), top_pollutants, rotation=90)
+plt.yticks(range(len(top_pollutants)), top_pollutants)
+plt.title("Pairwise Lift (High Events C/L ≥ 0.8) — Top 12 Pollutants")
+plt.colorbar(im, label="Lift (>1 = co-occur more than chance)")
+plt.tight_layout()
+plt.savefig(fig2_path, dpi=200)
+plt.show()
+
+# -----------------------
+# FIGURE 3: Pairwise Co-Occurrence — Support vs Lift (all pairs with minimum support)
+# -----------------------
+fig3_path = "/mnt/data/fig3_pairs_support_vs_lift.png"
+pairs = []
+pollutants = list(co_mat.columns)
+for i, a in enumerate(pollutants):
+    for b in pollutants[i+1:]:
+        co = int(co_mat.loc[a, b])
+        sA = int(support[a])
+        sB = int(support[b])
+        if sA == 0 or sB == 0 or co == 0:
+            continue
+        lift = (co * n_groups) / (sA * sB)
+        pairs.append({"A": a, "B": b, "Support_A": sA, "Support_B": sB, "Co_Support": co, "Lift": lift})
+pair_df = pd.DataFrame(pairs)
+pair_df_min = pair_df[(pair_df["Co_Support"] >= 8) & (pair_df["Support_A"] >= 15) & (pair_df["Support_B"] >= 15)]
+
+plt.figure()
+plt.scatter(pair_df_min["Co_Support"], pair_df_min["Lift"])
+plt.xlabel("Co-Support (# samples with both high)")
+plt.ylabel("Lift")
+plt.title("Pairwise Co-Occurrence: Support vs Lift")
+plt.tight_layout()
+plt.savefig(fig3_path, dpi=200)
+plt.show()
+
+# -----------------------
+# FIGURE 4: Time-Shuffled Null — mixture-only exceedance counts vs observed
+# -----------------------
+fig4_path = "/mnt/data/fig4_null_hist_vs_observed.png"
+# Build null by shuffling columns
+rng = np.random.default_rng(42)
+n_runs = 150
+shuf_counts = []
+for _ in range(n_runs):
+    shuf = pivot.copy()
+    for col in shuf.columns:
+        vals = shuf[col].values
+        rng.shuffle(vals)
+        shuf[col] = vals
+    shuf_sum = shuf.sum(axis=1, skipna=True)
+    shuf_single = (shuf > 1.0).any(axis=1)
+    shuf_mix_only = (shuf_sum >= 1.0) & (~shuf_single)
+    shuf_counts.append(int(shuf_mix_only.sum()))
+
+obs_mix_only = int(((mixture_sum >= 1.0) & (~single_exceed)).sum())
+
+plt.figure()
+plt.hist(shuf_counts, bins=20)
+plt.axvline(obs_mix_only, linestyle="--")
+plt.title("Mixture-Only Exceedances: Null Distribution vs Observed")
+plt.xlabel("Mixture-only exceedance count per shuffle")
+plt.ylabel("Frequency")
+plt.tight_layout()
+plt.savefig(fig4_path, dpi=200)
+plt.show()
+
+# -----------------------
+# FIGURE 5: Time series — daily rate of single vs mixture-only exceedances
+# -----------------------
+fig5_path = "/mnt/data/fig5_time_series_rates.png"
+daily = mixture_summary.copy()
+daily["Date"] = pd.to_datetime(daily["Date Collected"]).dt.date
+rates = daily.groupby("Date").agg(
+    total=("Any_Single_Exceed","size"),
+    single_exceed=("Any_Single_Exceed","mean"),
+    mixture_only=("Mixture_Exceed_Only","mean")
+).reset_index()
+
+plt.figure()
+plt.plot(rates["Date"], rates["single_exceed"])
+plt.plot(rates["Date"], rates["mixture_only"])
+plt.xticks(rotation=45)
+plt.ylabel("Rate")
+plt.title("Daily Rate: Single Exceedance vs Mixture-Only Exceedance")
+plt.tight_layout()
+plt.savefig(fig5_path, dpi=200)
+plt.show()
+
+# -----------------------
+# FIGURE 6: Boxplots — C/L distribution for top-12 pollutants
+# -----------------------
+fig6_path = "/mnt/data/fig6_boxplots_top12.png"
+cl_top = pivot[top_pollutants]
+
+plt.figure()
+plt.boxplot([cl_top[c].dropna().values for c in cl_top.columns], showfliers=False)
+plt.xticks(range(1, len(cl_top.columns)+1), cl_top.columns, rotation=90)
+plt.ylabel("C/L Ratio")
+plt.title("C/L Ratio Distribution — Top 12 Pollutants (Boxplots)")
+plt.tight_layout()
+plt.savefig(fig6_path, dpi=200)
+plt.show()
+
+{
+    "fig1": fig1_path,
+    "fig2": fig2_path,
+    "fig3": fig3_path,
+    "fig4": fig4_path,
+    "fig5": fig5_path,
+    "fig6": fig6_path
+}
