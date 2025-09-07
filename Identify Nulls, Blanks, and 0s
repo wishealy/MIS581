@@ -1,0 +1,92 @@
+# =============================================
+# Step 1: Identify nulls vs blanks vs zeros
+# =============================================
+
+def check_null_blank_zero(df: pd.DataFrame, name: str):
+    print(f"\n--- {name} ---")
+    results = []
+    for col in df.columns:
+        # Treat empty strings ("") separately
+        blanks = (df[col] == "").sum() if df[col].dtype == object else 0
+        nulls  = df[col].isna().sum()
+        zeros  = (df[col] == 0).sum() if pd.api.types.is_numeric_dtype(df[col]) else 0
+
+        results.append({
+            "Column": col,
+            "Nulls": nulls,
+            "Blanks": blanks,
+            "Zeros": zeros,
+            "Total Rows": len(df),
+            "Percent Null": round(nulls/len(df)*100, 2),
+            "Percent Blank": round(blanks/len(df)*100, 2),
+            "Percent Zero": round(zeros/len(df)*100, 2)
+        })
+
+    report = pd.DataFrame(results)
+    print(report.to_string(index=False))
+    return report
+
+# Run checks for each table
+pv_report  = check_null_blank_zero(parameter_values_df, "Parameter Values")
+md_report  = check_null_blank_zero(monitoring_data_df, "Monitoring Data")
+ial_report = check_null_blank_zero(ind_allocation_limits_df, "Ind. Allocation Limits")
+iuc_report = check_null_blank_zero(ind_user_concentration_df, "Ind User Concentration")
+
+# =============================================
+# Step 2: Check and enforce data types
+# =============================================
+
+def enforce_types(df: pd.DataFrame, type_map: dict, name: str):
+    df = df.copy()
+    print(f"\n--- Type Enforcement: {name} ---")
+    for col, dtype in type_map.items():
+        if col in df.columns:
+            try:
+                if dtype == "numeric":
+                    df[col] = pd.to_numeric(df[col], errors="coerce")
+                elif dtype == "string":
+                    df[col] = df[col].astype(str).str.strip()
+                elif dtype == "datetime":
+                    df[col] = pd.to_datetime(df[col], errors="coerce")
+                else:
+                    print(f"  [!] Unknown dtype for {col}: {dtype}")
+            except Exception as e:
+                print(f"  [!] Could not convert {col}: {e}")
+    return df
+
+# Suggested type maps (adjust if you need stricter rules)
+pv_types = {c: "numeric" for c in parameter_values_df.columns if c != "Parameter ID"}
+pv_types["Parameter ID"] = "string"
+
+md_types = {"WWTP ID": "numeric", "Parameter ID": "string"}
+
+ial_types = {
+    "WWTP ID": "numeric",
+    "Industrial Facility Name": "string",
+    "Parameter ID": "string",
+    "Permit Limit (Conc. mg/L)": "numeric",
+    "Permit Limit (Load lb/d)": "numeric"
+}
+
+iuc_types = {
+    "WWTP ID": "numeric",
+    "Industrial Facility Name": "string",
+    "Parameter ID": "string",
+    "Recorded Value": "numeric",
+    "Date Collected": "datetime"
+}
+
+# Apply
+parameter_values_df       = enforce_types(parameter_values_df, pv_types, "Parameter Values")
+monitoring_data_df        = enforce_types(monitoring_data_df, md_types, "Monitoring Data")
+ind_allocation_limits_df  = enforce_types(ind_allocation_limits_df, ial_types, "Ind. Allocation Limits")
+ind_user_concentration_df = enforce_types(ind_user_concentration_df, iuc_types, "Ind User Concentration")
+
+# =============================================
+# Step 3: Preview cleaned types
+# =============================================
+print("\nData types after cleaning:")
+print("Parameter Values:", parameter_values_df.dtypes)
+print("Monitoring Data:", monitoring_data_df.dtypes)
+print("Ind. Allocation Limits:", ind_allocation_limits_df.dtypes)
+print("Ind User Concentration:", ind_user_concentration_df.dtypes)
