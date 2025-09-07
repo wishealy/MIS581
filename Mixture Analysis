@@ -1,0 +1,181 @@
+import pandas as pd
+import numpy as np
+from itertools import combinations
+from pathlib import Path
+import caas_jupyter_tools
+
+# Expect that Step 1 created a 'merged' dataframe in the kernel.
+# If not present (e.g., after a reset), rebuild it quickly from the uploaded file.
+try:
+    merged
+except NameError:
+    file_path = Path("/mnt/data/industrial_dataset.xlsx")
+    xlsx = pd.ExcelFile(file_path)
+    dfs = {sheet: pd.read_excel(file_path, sheet_name=sheet) for sheet in xlsx.sheet_names}
+    conc = dfs["Ind User Concentration"].copy()
+    lims = dfs["Ind. Allocation Limits"].copy()
+    # Clean minimal fields
+    for df in (conc, lims):
+        df.columns = [str(c).strip() for c in df.columns]
+    conc["Recorded Value"] = pd.to_numeric(conc["Recorded Value"], errors="coerce")
+    conc["WWTP ID"] = pd.to_numeric(conc["WWTP ID"], errors="coerce")
+    conc["Date Collected"] = pd.to_datetime(conc["Date Collected"], errors="coerce")
+    lims["WWTP ID"] = pd.to_numeric(lims["WWTP ID"], errors="coerce")
+    lims["Permit Limit (Conc. mg/L)"] = pd.to_numeric(lims["Permit Limit (Conc. mg/L)"], errors="coerce")
+    # ND rule
+    conc.loc[conc["Recorded Value"] < 0.01, "Recorded Value"] = 0.005
+    # Merge
+    merged = pd.merge(
+        conc, 
+        lims[["WWTP ID","Industrial Facility Name","Parameter ID","Permit Limit (Conc. mg/L)"]],
+        on=["WWTP ID","Industrial Facility Name","Parameter ID"],
+        how="left"
+    )
+    merged["CL_Ratio"] = merged["Recorded Value"] / merged["Permit Limit (Conc. mg/L)"]
+    merged["Exceedance"] = merged["CL_Ratio"] > 1.0
+
+# Keep rows where we have a limit and a recorded value
+work = merged.dropna(subset=["CL_Ratio", "Date Collected"]).copy()
+
+# Build group key: facility × date (and WWTP in case of multiple plants)
+group_cols = ["WWTP ID", "Industrial Facility Name", "Date Collected"]
+pivot = work.pivot_table(index=group_cols, columns="Parameter ID", values="CL_Ratio", aggfunc="max")
+
+# Mixture metrics per sample
+mixture_sum = pivot.sum(axis=1, skipna=True)
+single_exceed = (pivot > 1.0).any(axis=1)
+mixture_exceed = (mixture_sum >= 1.0) & (~single_exceed)
+
+mixture_summary = pd.DataFrame({
+    "Mixture_Sum": mixture_sum,
+    "Any_Single_Exceed": single_exceed,
+    "Mixture_Exceed_Only": mixture_exceed
+}).reset_index()
+
+# Overall stats
+obs_total_samples = len(mixture_summary)
+obs_single_exceed_cnt = mixture_summary["Any_Single_Exceed"].sum()
+obs_mixture_only_cnt = mixture_summary["Mixture_Exceed_Only"].sum()
+obs_mixture_sum_quantiles = mixture_summary["Mixture_Sum"].quantile([0.5, 0.75, 0.9, 0.95, 0.99])
+
+# High-threshold flags for co-occurrence (>= 0.8 C/L)
+high_flags = (pivot >= 0.8).astype(int)
+n_groups = len(high_flags)
+
+# Supports per pollutant
+support = high_flags.sum(axis=0).astype(int)
+
+# Co-occurrence matrix (pairs) via matrix multiplication
+co_mat = (high_flags.T @ high_flags).astype(int)
+# Remove self-counts for pair analysis
+for c in co_mat.columns:
+    co_mat.loc[c, c] = 0
+
+# Compute pair metrics
+pairs = []
+pollutants = list(co_mat.columns)
+for i, a in enumerate(pollutants):
+    for b in pollutants[i+1:]:
+        co = int(co_mat.loc[a, b])
+        sA = int(support[a])
+        sB = int(support[b])
+        if sA == 0 or sB == 0:
+            continue
+        lift = (co * n_groups) / (sA * sB)
+        union = sA + sB - co
+        jaccard = co / union if union > 0 else np.nan
+        pairs.append({
+            "Pollutant_A": a,
+            "Pollutant_B": b,
+            "Support_A": sA,
+            "Support_B": sB,
+            "Co_Support": co,
+            "Lift": lift,
+            "Jaccard": jaccard
+        })
+
+pair_df = pd.DataFrame(pairs)
+# Filter to reasonably supported pairs
+pair_df = pair_df[(pair_df["Co_Support"] >= 10) & (pair_df["Support_A"] >= 20) & (pair_df["Support_B"] >= 20)]
+top_pairs = pair_df.sort_values(["Lift","Co_Support"], ascending=[False, False]).head(25)
+
+# Triad co-occurrence among top frequent pollutants
+top_pollutants = support.sort_values(ascending=False).head(12).index.tolist()
+triad_counts = {}
+for idx, row in high_flags[top_pollutants].iterrows():
+    active = [p for p, v in row.items() if v == 1]
+    for tri in combinations(active, 3):
+        tri = tuple(sorted(tri))
+        triad_counts[tri] = triad_counts.get(tri, 0) + 1
+
+triad_list = []
+for (a,b,c), obs in triad_counts.items():
+    sA, sB, sC = support[a], support[b], support[c]
+    # Independence expected count
+    expected = n_groups * (sA/n_groups) * (sB/n_groups) * (sC/n_groups)
+    tri_lift = (obs / expected) if expected > 0 else np.nan
+    triad_list.append({
+        "Pollutant_1": a, "Pollutant_2": b, "Pollutant_3": c,
+        "Triad_Co_Support": obs,
+        "Expected_Independence": expected,
+        "Triad_Lift": tri_lift
+    })
+
+triad_df = pd.DataFrame(triad_list)
+triad_df = triad_df[triad_df["Triad_Co_Support"] >= 8].sort_values(["Triad_Lift","Triad_Co_Support"], ascending=[False, False]).head(25)
+
+# Time-shuffled null for mixture exceedances
+# Shuffle each pollutant column independently across rows to break synchrony
+rng = np.random.default_rng(42)
+n_runs = 150
+shuf_counts = []
+for _ in range(n_runs):
+    shuf = pivot.copy()
+    for col in shuf.columns:
+        vals = shuf[col].values
+        rng.shuffle(vals)
+        shuf[col] = vals
+    shuf_sum = shuf.sum(axis=1, skipna=True)
+    shuf_single = (shuf > 1.0).any(axis=1)
+    shuf_mix_only = (shuf_sum >= 1.0) & (~shuf_single)
+    shuf_counts.append(int(shuf_mix_only.sum()))
+
+shuf_series = pd.Series(shuf_counts)
+null_summary = pd.DataFrame({
+    "Observed_Mixture_Only_Count": [int(obs_mixture_only_cnt)],
+    "Null_Mean": [float(shuf_series.mean())],
+    "Null_Std": [float(shuf_series.std())],
+    "Null_5%": [float(shuf_series.quantile(0.05))],
+    "Null_95%": [float(shuf_series.quantile(0.95))],
+    "P_Value_OneSided": [float((shuf_series >= obs_mixture_only_cnt).mean())],
+    "Observed/Null_Mean": [float(obs_mixture_only_cnt / shuf_series.mean()) if shuf_series.mean()>0 else np.nan]
+})
+
+# Save outputs for your report
+out_dir = Path("/mnt/data")
+mixture_summary_path = out_dir / "mixture_summary_by_sample.csv"
+pair_path = out_dir / "pairwise_cooccurrence_top25.csv"
+triad_path = out_dir / "triad_cooccurrence_top25.csv"
+null_path = out_dir / "mixture_null_comparison.csv"
+
+mixture_summary.to_csv(mixture_summary_path, index=False)
+top_pairs.to_csv(pair_path, index=False)
+triad_df.to_csv(triad_path, index=False)
+null_summary.to_csv(null_path, index=False)
+
+# Display key outputs
+caas_jupyter_tools.display_dataframe_to_user("Mixture Summary by Sample (preview)", mixture_summary.head(20))
+caas_jupyter_tools.display_dataframe_to_user("Top Pairwise Co-Occurrences (Lift-ranked)", top_pairs)
+caas_jupyter_tools.display_dataframe_to_user("Top Triad Co-Occurrences (Lift-ranked)", triad_df)
+caas_jupyter_tools.display_dataframe_to_user("Mixture Exceedance: Observed vs Time-Shuffled Null", null_summary)
+
+{
+    "mixture_summary_csv": str(mixture_summary_path),
+    "pairwise_top25_csv": str(pair_path),
+    "triad_top25_csv": str(triad_path),
+    "null_comparison_csv": str(null_path),
+    "obs_tot_samples": int(obs_total_samples),
+    "obs_single_exceed_cnt": int(obs_single_exceed_cnt),
+    "obs_mixture_only_cnt": int(obs_mixture_only_cnt),
+    "mixture_sum_quantiles": {str(k): float(v) for k, v in obs_mixture_sum_quantiles.items()}
+}
